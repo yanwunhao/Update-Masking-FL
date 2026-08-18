@@ -51,9 +51,10 @@ CORRECTNESS NOTES (the whole point of the script)
     infinity and 1/Delta_S as 0.0, and the bounds assertion is skipped rather
     than a plausible-looking finite number being emitted.
 
-  * Bounds assertion every round: 1/Delta_S in [1, K_c] up to tolerance, else
-    raise. See BOUNDS_NOTE -- the upper bound is a theorem, the lower bound is an
-    empirical expectation, and the run is configured to trust the spec and abort.
+  * Bounds assertion every round: 1/Delta_S in (0, K_c] up to tolerance, else
+    raise. See BOUNDS_NOTE -- the upper bound is a theorem (Cauchy-Schwarz) and
+    a violation is a bug, while below 1 is a real net-cancelling cohort, flagged
+    with `cancellation_regime` and counted in the end-of-run summary.
 
 PORTABILITY
     The same seed and the same experimental arguments must produce the same
@@ -120,7 +121,7 @@ CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 # terms is ~1e-13 relative, so 1e-9 is ~4 orders of margin.
 UNDERFLOW_REL = 1e-9
 
-# Slack on the [1, K_c] assertion, relative to K_c.
+# Slack on the upper-bound (K_c) assertion, relative to K_c.
 BOUNDS_TOL = 1e-6
 
 DTYPES = ("fp32", "tf32", "amp")
@@ -132,23 +133,27 @@ DECOMP_TOL = 1e-9
 
 # BOUNDS_NOTE
 # -----------
+# The measured range is 1/Delta_S in (0, K_c].
+#
 # The upper bound is a theorem: Cauchy-Schwarz gives ||sum_k D_k||^2 <= K_c *
 # sum_k ||D_k||^2 for any vectors whatsoever, so 1/Delta_S <= K_c always, and a
-# violation is unambiguously a bug in this file.
+# violation is unambiguously a bug in this file. It stays a hard raise.
 #
-# The lower bound is NOT a theorem. 1/Delta_S >= 1 holds iff the cross terms are
-# non-negative on average, sum_{j != k} <D_j, D_k> >= 0. That is the empirically
-# usual case -- clients mostly agree on the descent direction -- but strongly
-# non-IID cohorts can genuinely produce net-cancelling pseudo-gradients, and
-# then 1/Delta_S < 1 is a real measurement, not an error.
+# The lower bound is NOT 1. 1/Delta_S >= 1 holds iff the cross terms are
+# non-negative on average, sum_{j != k} <D_j, D_k> >= 0. That is a
+# positive-correlation condition on the cohort -- the empirically usual case,
+# since clients mostly agree on the descent direction -- but it is not an
+# identity, and a net-cancelling cohort genuinely produces 1/Delta_S < 1. This
+# was observed in production at alpha=100, seed 1, batch 32, tau=1, which gave
+# 1/Delta_S = 0.9906; the old [1, K_c] assertion crashed that run on a correct
+# measurement.
 #
-# The spec for this experiment asks for a hard raise on [1, K_c], so that is what
-# happens: no clamping, no warn-and-continue. The offending record is flushed to
-# the JSONL first, so if a low-alpha run does trip it the round that did so is on
-# disk and the value can be read off directly. If that turns out to be a genuine
-# sub-unit measurement rather than a bug, the fix is to relax LOWER_BOUND here --
-# deliberately, not silently.
-LOWER_BOUND = 1.0
+# All that survives on the low side is positivity: ||sum_k D_k||^2 > 0 whenever
+# the row is not underflow-flagged, so 1/Delta_S > 0. Rounds below 1 are real
+# measurements: they are neither clamped nor warned about per round, only marked
+# with the boolean column `cancellation_regime` and counted in the end-of-run
+# summary.
+CANCELLATION_THRESHOLD = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -463,20 +468,43 @@ def diversity(deltas: list[torch.Tensor], n_k: list[int]) -> dict[str, Any]:
     return out
 
 
-def assert_bounds(inv: float, K_c: int, tag: str, underflow: bool) -> None:
-    """1/Delta_S in [1, K_c] up to tolerance. Raise on violation -- see BOUNDS_NOTE."""
+def assert_bounds(inv: float, K_c: int, tag: str, underflow: bool) -> bool:
+    """
+    Assert 1/Delta_S in (0, K_c] up to tolerance; return the cancellation flag.
+
+    The upper bound is Cauchy-Schwarz and a violation raises. Below it only
+    positivity is asserted: a value in (0, 1) is a real net-cancelling cohort,
+    so it is reported as True rather than raised on -- see BOUNDS_NOTE.
+    """
     if underflow:
-        return                              # flagged row; the ratio is not a measurement
-    tol = BOUNDS_TOL * max(K_c, 1)
-    if not (LOWER_BOUND - tol <= inv <= K_c + tol):
+        return False                        # flagged row; the ratio is not a measurement
+    if not inv > 0.0:
         raise RuntimeError(
             f"gradient-diversity bounds violated ({tag}): 1/Delta_S = {inv!r} "
-            f"outside [{LOWER_BOUND}, {K_c}] (tol {tol:g}). "
-            "Upper-bound violations are always a bug in this file (Cauchy-Schwarz). "
-            "Lower-bound violations may be a real net-cancelling cohort -- see "
-            "BOUNDS_NOTE in fed_diversity.py. The offending round has already been "
-            "written to the JSONL."
+            "is not positive. ||sum_k D_k||^2 > 0 on any row not flagged as "
+            "denominator underflow, so this is a bug in this file. The offending "
+            "round has already been written to the JSONL."
         )
+    if inv > K_c * (1.0 + BOUNDS_TOL):
+        raise RuntimeError(
+            f"gradient-diversity bounds violated ({tag}): 1/Delta_S = {inv!r} "
+            f"exceeds K_c = {K_c} (rel tol {BOUNDS_TOL:g}). Cauchy-Schwarz makes "
+            "this unambiguously a bug in this file -- see BOUNDS_NOTE. The "
+            "offending round has already been written to the JSONL."
+        )
+    return inv < CANCELLATION_THRESHOLD
+
+
+def cancellation_flag(stats: dict[str, Any]) -> bool:
+    """
+    True if either variant measured 1/Delta_S < 1 on a row that is a measurement.
+
+    Pure: it never raises, so the flag can be stamped on the record before the
+    record is flushed and the bounds are asserted. See BOUNDS_NOTE.
+    """
+    return any(not stats[f"denominator_underflow_{tag}"]
+               and stats[f"inv_delta_s_{tag}"] < CANCELLATION_THRESHOLD
+               for tag in ("unweighted", "weighted"))
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +841,7 @@ def run(cfg: Config, data: DeviceCifar | None = None) -> str:
 
     t0 = time.time()
     acc = None
+    n_cancelling = 0
     try:
         for rnd in range(cfg.rounds):
             r_t0 = time.time()
@@ -844,8 +873,12 @@ def run(cfg: Config, data: DeviceCifar | None = None) -> str:
             else:
                 acc = None
 
+            cancelling = cancellation_flag(stats)
+            n_cancelling += cancelling
+
             rec = {
                 "record": "round",
+                "cancellation_regime": cancelling,
                 "round": rnd,
                 "alpha": cfg.alpha,
                 "seed": cfg.seed,
@@ -879,6 +912,8 @@ def run(cfg: Config, data: DeviceCifar | None = None) -> str:
                if device.type == "cuda" else None)
     fh.write(json.dumps({
         "record": "footer", "done": True, "rounds": cfg.rounds,
+        "cancellation_rounds": n_cancelling,
+        "cancellation_fraction": n_cancelling / max(cfg.rounds, 1),
         "final_test_acc": acc, "total_seconds": total,
         "seconds_per_round": total / max(cfg.rounds, 1),
         "peak_memory_mb": peak_mb,
@@ -888,6 +923,11 @@ def run(cfg: Config, data: DeviceCifar | None = None) -> str:
     print(f"[fed_diversity] {os.path.basename(out_path)}: {total / 60:.1f} min "
           f"({total / max(cfg.rounds, 1):.1f} s/round)"
           + (f", peak GPU {peak_mb:.0f} MiB" if peak_mb is not None else ""))
+    # Sub-unit 1/Delta_S is a real net-cancelling cohort, not an error (BOUNDS_NOTE).
+    # Reported once here rather than warned about round by round.
+    print(f"[fed_diversity] {os.path.basename(out_path)}: cancellation regime "
+          f"(1/Delta_S < 1) in {n_cancelling}/{cfg.rounds} rounds "
+          f"({n_cancelling / max(cfg.rounds, 1):.1%})")
     return out_path
 
 

@@ -145,16 +145,54 @@ def test_cancellation_is_flagged_not_reported():
     fd.assert_bounds(s["inv_delta_s_unweighted"], 2, "unweighted", True)
 
 
-def test_bounds_assertion_raises_both_ways():
-    for bad, K in ((0.5, 10), (10.5, 10)):
+def test_upper_bound_violation_raises():
+    """1/Delta_S > K_c is Cauchy-Schwarz-impossible, so it stays a hard raise."""
+    for bad, K in ((10.5, 10), (2.001, 2)):
         try:
             fd.assert_bounds(bad, K, "unweighted", False)
         except RuntimeError:
             pass
         else:
             raise AssertionError(f"expected a raise for 1/Delta_S={bad}, K_c={K}")
-    fd.assert_bounds(1.0, 10, "unweighted", False)
-    fd.assert_bounds(10.0, 10, "unweighted", False)
+    # Non-positive is impossible on a row that is not underflow-flagged.
+    for bad in (0.0, -1e-12):
+        try:
+            fd.assert_bounds(bad, 10, "unweighted", False)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"expected a raise for 1/Delta_S={bad}")
+    # Inside (0, K_c]: no raise, and only below 1 is the regime flagged.
+    assert fd.assert_bounds(1.0, 10, "unweighted", False) is False
+    assert fd.assert_bounds(10.0, 10, "unweighted", False) is False
+    assert fd.assert_bounds(1e-6, 10, "unweighted", False) is True
+
+
+def test_net_cancelling_cohort_is_flagged_below_one_and_does_not_raise():
+    """
+    K_c/2 clients at +v and K_c/2 at -v: the cross terms sum negative, so
+    1/Delta_S < 1 legitimately. Small noise keeps the sum well clear of the
+    underflow guard, so this is a measurement, not a flagged row. See BOUNDS_NOTE.
+    """
+    K = 10
+    g = torch.Generator().manual_seed(11)
+    v = torch.randn(4096, generator=g)
+    deltas = [(v if k < K // 2 else -v) + 0.01 * torch.randn(4096, generator=g)
+              for k in range(K)]
+    s = fd.diversity(deltas, [1] * K)
+
+    assert s["denominator_underflow_unweighted"] is False
+    inv = s["inv_delta_s_unweighted"]
+    assert 0.0 < inv < 1.0, inv
+    # No exception, and the cancellation regime is reported.
+    assert fd.assert_bounds(inv, K, "unweighted", False) is True
+    assert fd.cancellation_flag(s) is True
+
+    # A positively-correlated cohort of the same shape stays at or above 1.
+    same = [v + 0.01 * torch.randn(4096, generator=g) for _ in range(K)]
+    s2 = fd.diversity(same, [1] * K)
+    assert s2["inv_delta_s_unweighted"] > 1.0
+    assert fd.cancellation_flag(s2) is False
 
 
 def test_flatten_roundtrip_is_parameters_only():
@@ -240,14 +278,16 @@ def test_smoke_path_runs_and_logs_everything():
         "norm_sq_of_sum_unweighted", "sum_of_sq_norms_unweighted",
         "delta_norm_mean_unweighted", "delta_norm_std_unweighted",
         "mu2_hat", "sigma2_hat", "r_hat", "one_over_delta_s_predicted",
-        "sigma2_clamped", "elapsed_seconds",
+        "sigma2_clamped", "elapsed_seconds", "cancellation_regime",
     }
     for r in rounds:
         assert required <= set(r), sorted(required - set(r))
         assert len(r["cohort"]) == r["K_c"] == 3
         assert len(set(r["cohort"])) == 3            # sampled without replacement
         assert max(r["cohort"]) < 20                 # cohort drawn from the population
-        assert 1.0 - 1e-6 <= r["inv_delta_s_unweighted"] <= 3.0 + 1e-6
+        # (0, K_c] -- below 1 is a legitimate net-cancelling cohort (BOUNDS_NOTE).
+        assert 0.0 < r["inv_delta_s_unweighted"] <= 3.0 * (1 + 1e-6)
+        assert isinstance(r["cancellation_regime"], bool)
     assert rounds[-1]["test_acc"] is not None
 
 
