@@ -1,0 +1,25 @@
+\begin{table}[t]
+  \centering
+  \caption{FedAvg on a near-IID split ($\alpha=100$), $K_c=10$ of 100 clients per round, 200 rounds, 3 seeds, sweeping local batch size $b$ and epochs $\tau$ over $T=\lceil \bar{n}_k/b\rceil\,\tau$ local steps per round ($\bar{n}_k\approx500$). Entries are medians across seeds of each run's median over the last 50 rounds; $K_c=10$ is the ceiling on $1/\Delta_S$.}
+  \label{tab:local-steps}
+  \footnotesize
+  \setlength{\tabcolsep}{2.5pt}
+  \begin{tabular}{@{}lrrrrrrrr@{}}
+    \toprule
+    & & & \multicolumn{2}{c}{$1/\Delta_S$} & & & & \\
+    \cmidrule(lr){4-5}
+    $b$ & $\tau$ & $T$ & unwtd. & $n_k$-wtd. & $\hat{\mu}^2$ & $\hat{\sigma}^2$ & acc & $\substack{\text{rds.}\\<1\,\%}$ \\
+    \midrule
+    full & 1 & 1 & 8.96 & 8.95 & $3.6\times10^{-3}$ & $4.9\times10^{-4}$ & 0.314 & 0.0 \\
+    full & 2 & 2 & 4.13 & 4.13 & $6.2\times10^{-4}$ & $1.2\times10^{-3}$ & 0.383 & 0.0 \\
+    full & 5 & 5 & 3.96 & 3.96 & $3.7\times10^{-3}$ & $7.6\times10^{-3}$ & 0.493 & 0.0 \\
+    \midrule
+    128 & 1 & 4 & 1.36 & 1.35 & $8.4\times10^{-4}$ & $1.9\times10^{-2}$ & 0.449 & 4.5 \\
+    128 & 2 & 8 & 1.32 & 1.31 & $1.2\times10^{-3}$ & $3.4\times10^{-2}$ & 0.534 & 1.7 \\
+    32 & 1 & 16 & 1.24 & 1.24 & $2.1\times10^{-3}$ & $7.4\times10^{-2}$ & 0.553 & 1.0 \\
+    128 & 5 & 20 & 1.18 & 1.18 & $2.8\times10^{-3}$ & $1.2\times10^{-1}$ & 0.683 & 0.0 \\
+    32 & 2 & 32 & 1.19 & 1.19 & $4.1\times10^{-3}$ & $1.9\times10^{-1}$ & 0.680 & 0.0 \\
+    32 & 5 & 80 & 1.10 & 1.10 & $7.3\times10^{-3}$ & $6.0\times10^{-1}$ & 0.814 & 0.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
